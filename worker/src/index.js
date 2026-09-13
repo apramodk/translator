@@ -111,15 +111,22 @@ export default {
         });
       }
 
+      const diarize = incomingForm.get("diarize");
+
       const forwardForm = new FormData();
       forwardForm.append("file", file, file.name || "audio.webm");
       forwardForm.append("model", "whisper-v3-turbo");
-      forwardForm.append("response_format", "verbose_json");
-      forwardForm.append("timestamp_granularities", "word");
+      if (diarize) {
+        // Word-level timestamps + speaker labels only needed for the final pass —
+        // keeps the fast rolling live-caption requests lighter/quicker.
+        forwardForm.append("response_format", "verbose_json");
+        forwardForm.append("timestamp_granularities", "word");
+        forwardForm.append("diarize", "true");
+      } else {
+        forwardForm.append("response_format", "json");
+      }
       const language = incomingForm.get("language");
       if (language) forwardForm.append("language", language);
-      const diarize = incomingForm.get("diarize");
-      if (diarize) forwardForm.append("diarize", "true");
 
       const fireworksResp = await fetch(
         "https://audio-turbo.api.fireworks.ai/v1/audio/transcriptions",

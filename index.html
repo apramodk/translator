@@ -123,7 +123,7 @@
     }
 
     const WORKER_URL = 'https://translator-transcribe.lablegacy.workers.dev/transcribe';
-    const LIVE_CHUNK_MS = 4000; // how often we ship a rolling chunk for near-live captions
+    const LIVE_CHUNK_MS = 1500; // shorter window = lower latency captions
 
     const recordBtn = document.getElementById('recordBtn');
     const statusEl = document.getElementById('status');
