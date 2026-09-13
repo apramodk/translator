@@ -58,17 +58,42 @@
     button.recording { background: #22c55e; transform: scale(1.03); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { min-height: 1.4em; color: #94a3b8; margin-top: 10px; font-size: 0.9rem; }
-    #transcript {
-      margin-top: 20px;
+
+    canvas#waveform {
+      width: 100%;
+      height: 80px;
+      margin-top: 16px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.25);
+      display: block;
+    }
+
+    .section-label {
+      text-align: left;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      margin: 16px 0 6px;
+    }
+
+    #liveTranscript, #finalTranscript {
       text-align: left;
       background: rgba(0,0,0,0.25);
       border-radius: 12px;
       padding: 16px;
-      min-height: 60px;
+      min-height: 50px;
       white-space: pre-wrap;
       font-size: 1rem;
       line-height: 1.4;
     }
+
+    .speaker-0 { color: #7dd3fc; }
+    .speaker-1 { color: #fca5a5; }
+    .speaker-2 { color: #bef264; }
+    .speaker-3 { color: #fcd34d; }
+    .speaker-label { font-weight: 700; display: block; margin-top: 8px; }
+    .speaker-label:first-child { margin-top: 0; }
   </style>
 </head>
 <body>
@@ -79,7 +104,14 @@
 
       <button id="recordBtn">🎙️ Start Recording</button>
       <div id="status"></div>
-      <div id="transcript">Transcript will appear here…</div>
+
+      <canvas id="waveform" width="600" height="160"></canvas>
+
+      <div class="section-label">Live (updates every few seconds)</div>
+      <div id="liveTranscript">Transcript will appear here…</div>
+
+      <div class="section-label">Final — speaker-labeled</div>
+      <div id="finalTranscript">Appears after you stop recording.</div>
     </div>
   </div>
 
@@ -91,14 +123,26 @@
     }
 
     const WORKER_URL = 'https://translator-transcribe.lablegacy.workers.dev/transcribe';
+    const LIVE_CHUNK_MS = 4000; // how often we ship a rolling chunk for near-live captions
 
     const recordBtn = document.getElementById('recordBtn');
     const statusEl = document.getElementById('status');
-    const transcriptEl = document.getElementById('transcript');
+    const liveEl = document.getElementById('liveTranscript');
+    const finalEl = document.getElementById('finalTranscript');
+    const canvas = document.getElementById('waveform');
+    const canvasCtx = canvas.getContext('2d');
 
-    let mediaRecorder = null;
-    let audioChunks = [];
+    let stream = null;
+    let audioCtx = null;
+    let analyser = null;
+    let rafId = null;
+
+    let fullRecorder = null;   // records the entire session, used for final diarized pass
+    let fullChunks = [];
+    let liveRecorder = null;   // short rolling recorder for near-live captions
+    let liveTimer = null;
     let isRecording = false;
+    let liveText = '';
 
     function pickMimeType() {
       const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
@@ -108,27 +152,109 @@
       return '';
     }
 
+    // ---------- Waveform visualizer ----------
+    function drawWaveform() {
+      rafId = requestAnimationFrame(drawWaveform);
+      const bufferLength = analyser.fftSize;
+      const dataArray = new Uint8Array(bufferLength);
+      analyser.getByteTimeDomainData(dataArray);
+
+      canvasCtx.fillStyle = 'rgba(0,0,0,0)';
+      canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+      canvasCtx.lineWidth = 3;
+      canvasCtx.strokeStyle = isRecording ? '#22c55e' : '#64748b';
+      canvasCtx.beginPath();
+
+      const sliceWidth = canvas.width / bufferLength;
+      let x = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * canvas.height) / 2;
+        if (i === 0) canvasCtx.moveTo(x, y);
+        else canvasCtx.lineTo(x, y);
+        x += sliceWidth;
+      }
+      canvasCtx.lineTo(canvas.width, canvas.height / 2);
+      canvasCtx.stroke();
+    }
+
+    function setupVisualizer(mediaStream) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      drawWaveform();
+    }
+
+    function teardownVisualizer() {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+        audioCtx = null;
+      }
+      canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // ---------- Rolling near-live captions ----------
+    function startLiveChunk() {
+      if (!isRecording) return;
+      const mimeType = pickMimeType();
+      liveRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const chunks = [];
+      liveRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      liveRecorder.onstop = async () => {
+        if (chunks.length) {
+          const blob = new Blob(chunks, { type: liveRecorder.mimeType || 'audio/webm' });
+          transcribeLiveChunk(blob);
+        }
+        if (isRecording) startLiveChunk(); // chain the next rolling window
+      };
+      liveRecorder.start();
+      liveTimer = setTimeout(() => {
+        if (liveRecorder && liveRecorder.state === 'recording') liveRecorder.stop();
+      }, LIVE_CHUNK_MS);
+    }
+
+    async function transcribeLiveChunk(blob) {
+      try {
+        const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+        const form = new FormData();
+        form.append('file', blob, `chunk.${ext}`);
+        const resp = await fetch(WORKER_URL, { method: 'POST', body: form });
+        const data = await resp.json();
+        if (resp.ok && data.text && data.text.trim()) {
+          liveText += (liveText ? ' ' : '') + data.text.trim();
+          liveEl.textContent = liveText;
+        }
+      } catch (_) {
+        // Non-fatal — just skip this window's caption.
+      }
+    }
+
+    // ---------- Recording lifecycle ----------
     async function startRecording() {
       try {
         // iOS routes this to whatever mic is active system-wide — including
         // connected AirPods — automatically. No special pairing code needed.
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        setupVisualizer(stream);
+
         const mimeType = pickMimeType();
-        mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-        audioChunks = [];
+        fullRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+        fullChunks = [];
+        fullRecorder.ondataavailable = (e) => { if (e.data.size > 0) fullChunks.push(e.data); };
+        fullRecorder.start();
 
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) audioChunks.push(e.data);
-        };
+        liveText = '';
+        liveEl.textContent = 'Listening…';
+        finalEl.textContent = 'Appears after you stop recording.';
 
-        mediaRecorder.onstop = async () => {
-          stream.getTracks().forEach((t) => t.stop());
-          const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-          await sendForTranscription(blob);
-        };
-
-        mediaRecorder.start();
         isRecording = true;
+        startLiveChunk();
+
         recordBtn.textContent = '⏹️ Stop Recording';
         recordBtn.classList.add('recording');
         statusEl.textContent = 'Listening… (using system mic — AirPods if connected)';
@@ -138,36 +264,69 @@
     }
 
     function stopRecording() {
-      if (mediaRecorder && isRecording) {
-        mediaRecorder.stop();
-        isRecording = false;
-        recordBtn.textContent = '🎙️ Start Recording';
-        recordBtn.classList.remove('recording');
-        statusEl.textContent = 'Transcribing…';
-        recordBtn.disabled = true;
-      }
+      if (!isRecording) return;
+      isRecording = false;
+      clearTimeout(liveTimer);
+      if (liveRecorder && liveRecorder.state === 'recording') liveRecorder.stop();
+
+      recordBtn.textContent = '🎙️ Start Recording';
+      recordBtn.classList.remove('recording');
+      statusEl.textContent = 'Finalizing…';
+      recordBtn.disabled = true;
+
+      fullRecorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        teardownVisualizer();
+        const blob = new Blob(fullChunks, { type: fullRecorder.mimeType || 'audio/webm' });
+        await transcribeFinalWithSpeakers(blob);
+      };
+      fullRecorder.stop();
     }
 
-    async function sendForTranscription(blob) {
+    async function transcribeFinalWithSpeakers(blob) {
       try {
         const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
         const form = new FormData();
         form.append('file', blob, `audio.${ext}`);
+        form.append('diarize', 'true');
 
         const resp = await fetch(WORKER_URL, { method: 'POST', body: form });
         const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
 
-        if (!resp.ok) {
-          throw new Error(data.error || `HTTP ${resp.status}`);
-        }
-
-        transcriptEl.textContent = data.text || '(no speech detected)';
+        renderSpeakerTranscript(data);
         statusEl.textContent = 'Done.';
       } catch (err) {
-        statusEl.textContent = 'Transcription failed: ' + err.message;
+        finalEl.textContent = 'Transcription failed: ' + err.message;
+        statusEl.textContent = '';
       } finally {
         recordBtn.disabled = false;
       }
+    }
+
+    function renderSpeakerTranscript(data) {
+      const words = data.words || [];
+      if (!words.length) {
+        finalEl.textContent = data.text || '(no speech detected)';
+        return;
+      }
+      finalEl.innerHTML = '';
+      let currentSpeaker = null;
+      let currentSpan = null;
+      words.forEach((w) => {
+        const speaker = w.speaker_id ?? '0';
+        if (speaker !== currentSpeaker) {
+          currentSpeaker = speaker;
+          const label = document.createElement('span');
+          const idx = parseInt(speaker.toString().replace(/\D/g, ''), 10) % 4 || 0;
+          label.className = `speaker-label speaker-${idx}`;
+          label.textContent = `Speaker ${speaker}`;
+          finalEl.appendChild(label);
+          currentSpan = document.createElement('span');
+          finalEl.appendChild(currentSpan);
+        }
+        currentSpan.textContent += (currentSpan.textContent ? ' ' : '') + w.word;
+      });
     }
 
     recordBtn.addEventListener('click', () => {

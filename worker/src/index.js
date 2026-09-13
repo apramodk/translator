@@ -17,10 +17,77 @@ function corsHeaders(origin) {
   };
 }
 
+async function handleStream(request, env) {
+  const origin = request.headers.get("Origin") || "";
+  if (!ALLOWED_ORIGINS.has(origin)) {
+    return new Response("Forbidden origin", { status: 403 });
+  }
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("Expected websocket", { status: 426 });
+  }
+
+  const url = new URL(request.url);
+  const language = url.searchParams.get("language") || "en";
+  const fireworksUrl =
+    `https://audio-streaming.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions/streaming?language=${encodeURIComponent(language)}`;
+
+  // Open the upstream WS to Fireworks (server-side, so we can attach the
+  // secret Authorization header — browsers can't set custom WS headers).
+  let upstreamResp;
+  try {
+    upstreamResp = await fetch(fireworksUrl, {
+      headers: {
+        Upgrade: "websocket",
+        Authorization: env.FIREWORKS_API_KEY,
+      },
+    });
+  } catch (err) {
+    return new Response("Upstream connection failed: " + err, { status: 502 });
+  }
+
+  const upstreamWs = upstreamResp.webSocket;
+  if (!upstreamWs) {
+    const text = await upstreamResp.text().catch(() => "");
+    return new Response(
+      `Upstream did not upgrade to websocket. status=${upstreamResp.status} body=${text}`,
+      { status: 502 }
+    );
+  }
+  upstreamWs.accept();
+
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+
+  server.addEventListener("message", (evt) => {
+    try { upstreamWs.send(evt.data); } catch (_) {}
+  });
+  upstreamWs.addEventListener("message", (evt) => {
+    try { server.send(evt.data); } catch (_) {}
+  });
+  server.addEventListener("close", (evt) => {
+    try { upstreamWs.close(evt.code, evt.reason); } catch (_) {}
+  });
+  upstreamWs.addEventListener("close", (evt) => {
+    try { server.close(evt.code, evt.reason); } catch (_) {}
+  });
+  server.addEventListener("error", () => { try { upstreamWs.close(); } catch (_) {} });
+  upstreamWs.addEventListener("error", () => { try { server.close(); } catch (_) {} });
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
     const cors = corsHeaders(origin);
+
+    const url = new URL(request.url);
+
+    if (url.pathname === "/stream") {
+      return handleStream(request, env);
+    }
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
@@ -30,7 +97,6 @@ export default {
       return new Response("Method not allowed", { status: 405, headers: cors });
     }
 
-    const url = new URL(request.url);
     if (url.pathname !== "/transcribe") {
       return new Response("Not found", { status: 404, headers: cors });
     }
@@ -48,9 +114,12 @@ export default {
       const forwardForm = new FormData();
       forwardForm.append("file", file, file.name || "audio.webm");
       forwardForm.append("model", "whisper-v3-turbo");
-      forwardForm.append("response_format", "json");
+      forwardForm.append("response_format", "verbose_json");
+      forwardForm.append("timestamp_granularities", "word");
       const language = incomingForm.get("language");
       if (language) forwardForm.append("language", language);
+      const diarize = incomingForm.get("diarize");
+      if (diarize) forwardForm.append("diarize", "true");
 
       const fireworksResp = await fetch(
         "https://audio-turbo.api.fireworks.ai/v1/audio/transcriptions",
