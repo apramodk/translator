@@ -99,16 +99,16 @@
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>👋 Hello, world!</h1>
-      <p>Translator app — installed as a home screen app.</p>
+      <h1>🇭🇰 Cantonese → English</h1>
+      <p>Live translation, powered on-device by your mic (+ AirPods).</p>
 
       <button id="recordBtn">🎙️ Start Recording</button>
       <div id="status"></div>
 
       <canvas id="waveform" width="600" height="160"></canvas>
 
-      <div class="section-label">Live (updates every few seconds)</div>
-      <div id="liveTranscript">Transcript will appear here…</div>
+      <div class="section-label">Live (updates every couple seconds)</div>
+      <div id="liveTranscript">Translation will appear here…</div>
 
       <div class="section-label">Final — speaker-labeled</div>
       <div id="finalTranscript">Appears after you stop recording.</div>
@@ -122,8 +122,9 @@
       });
     }
 
-    const WORKER_URL = 'https://translator-transcribe.lablegacy.workers.dev/transcribe';
+    const WORKER_BASE = 'https://translator-transcribe.lablegacy.workers.dev';
     const LIVE_CHUNK_MS = 1500; // shorter window = lower latency captions
+    const SOURCE_LANGUAGE = 'yue'; // Cantonese
 
     const recordBtn = document.getElementById('recordBtn');
     const statusEl = document.getElementById('status');
@@ -142,7 +143,6 @@
     let liveRecorder = null;   // short rolling recorder for near-live captions
     let liveTimer = null;
     let isRecording = false;
-    let liveText = '';
 
     function pickMimeType() {
       const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
@@ -218,20 +218,39 @@
       }, LIVE_CHUNK_MS);
     }
 
+    let liveEntries = []; // { source, translated }
+
     async function transcribeLiveChunk(blob) {
       try {
         const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
         const form = new FormData();
         form.append('file', blob, `chunk.${ext}`);
-        const resp = await fetch(WORKER_URL, { method: 'POST', body: form });
+        form.append('language', SOURCE_LANGUAGE);
+        const resp = await fetch(`${WORKER_BASE}/translate-live`, { method: 'POST', body: form });
         const data = await resp.json();
-        if (resp.ok && data.text && data.text.trim()) {
-          liveText += (liveText ? ' ' : '') + data.text.trim();
-          liveEl.textContent = liveText;
+        if (resp.ok && data.translated_text && data.translated_text.trim()) {
+          liveEntries.push({ source: data.source_text, translated: data.translated_text });
+          renderLiveTranscript();
         }
       } catch (_) {
         // Non-fatal — just skip this window's caption.
       }
+    }
+
+    function renderLiveTranscript() {
+      liveEl.innerHTML = liveEntries
+        .map(
+          (e) =>
+            `<div style="margin-bottom:10px"><div style="color:#94a3b8;font-size:0.85rem">${escapeHtml(e.source)}</div><div>${escapeHtml(e.translated)}</div></div>`
+        )
+        .join('');
+      liveEl.scrollTop = liveEl.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str || '';
+      return div.innerHTML;
     }
 
     // ---------- Recording lifecycle ----------
@@ -248,7 +267,7 @@
         fullRecorder.ondataavailable = (e) => { if (e.data.size > 0) fullChunks.push(e.data); };
         fullRecorder.start();
 
-        liveText = '';
+        liveEntries = [];
         liveEl.textContent = 'Listening…';
         finalEl.textContent = 'Appears after you stop recording.';
 
@@ -288,9 +307,9 @@
         const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
         const form = new FormData();
         form.append('file', blob, `audio.${ext}`);
-        form.append('diarize', 'true');
+        form.append('language', SOURCE_LANGUAGE);
 
-        const resp = await fetch(WORKER_URL, { method: 'POST', body: form });
+        const resp = await fetch(`${WORKER_BASE}/translate-final`, { method: 'POST', body: form });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
 
@@ -305,28 +324,21 @@
     }
 
     function renderSpeakerTranscript(data) {
-      const words = data.words || [];
-      if (!words.length) {
+      const segments = data.segments || [];
+      if (!segments.length) {
         finalEl.textContent = data.text || '(no speech detected)';
         return;
       }
-      finalEl.innerHTML = '';
-      let currentSpeaker = null;
-      let currentSpan = null;
-      words.forEach((w) => {
-        const speaker = w.speaker_id ?? '0';
-        if (speaker !== currentSpeaker) {
-          currentSpeaker = speaker;
-          const label = document.createElement('span');
-          const idx = parseInt(speaker.toString().replace(/\D/g, ''), 10) % 4 || 0;
-          label.className = `speaker-label speaker-${idx}`;
-          label.textContent = `Speaker ${speaker}`;
-          finalEl.appendChild(label);
-          currentSpan = document.createElement('span');
-          finalEl.appendChild(currentSpan);
-        }
-        currentSpan.textContent += (currentSpan.textContent ? ' ' : '') + w.word;
-      });
+      finalEl.innerHTML = segments
+        .map((seg, i) => {
+          const idx = parseInt(seg.speaker.toString().replace(/\D/g, ''), 10) % 4 || (i % 4);
+          return (
+            `<span class="speaker-label speaker-${idx}">Speaker ${seg.speaker}</span>` +
+            `<div style="color:#94a3b8;font-size:0.85rem">${escapeHtml(seg.text)}</div>` +
+            `<div>${escapeHtml(seg.translated)}</div>`
+          );
+        })
+        .join('');
     }
 
     recordBtn.addEventListener('click', () => {
