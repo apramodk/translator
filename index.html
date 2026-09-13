@@ -40,6 +40,34 @@
       border-radius: 20px;
       padding: 32px 24px;
       backdrop-filter: blur(10px);
+      width: 100%;
+      max-width: 420px;
+    }
+    button {
+      font-size: 1.1rem;
+      padding: 14px 28px;
+      border-radius: 999px;
+      border: none;
+      background: #f43f5e;
+      color: white;
+      font-weight: 600;
+      margin-top: 16px;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.2s ease;
+    }
+    button.recording { background: #22c55e; transform: scale(1.03); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { min-height: 1.4em; color: #94a3b8; margin-top: 10px; font-size: 0.9rem; }
+    #transcript {
+      margin-top: 20px;
+      text-align: left;
+      background: rgba(0,0,0,0.25);
+      border-radius: 12px;
+      padding: 16px;
+      min-height: 60px;
+      white-space: pre-wrap;
+      font-size: 1rem;
+      line-height: 1.4;
     }
   </style>
 </head>
@@ -48,6 +76,10 @@
     <div class="card">
       <h1>👋 Hello, world!</h1>
       <p>Translator app — installed as a home screen app.</p>
+
+      <button id="recordBtn">🎙️ Start Recording</button>
+      <div id="status"></div>
+      <div id="transcript">Transcript will appear here…</div>
     </div>
   </div>
 
@@ -57,6 +89,91 @@
         navigator.serviceWorker.register('sw.js');
       });
     }
+
+    const WORKER_URL = 'https://translator-transcribe.lablegacy.workers.dev/transcribe';
+
+    const recordBtn = document.getElementById('recordBtn');
+    const statusEl = document.getElementById('status');
+    const transcriptEl = document.getElementById('transcript');
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+
+    function pickMimeType() {
+      const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
+      for (const type of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
+      }
+      return '';
+    }
+
+    async function startRecording() {
+      try {
+        // iOS routes this to whatever mic is active system-wide — including
+        // connected AirPods — automatically. No special pairing code needed.
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = pickMimeType();
+        mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+          const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          await sendForTranscription(blob);
+        };
+
+        mediaRecorder.start();
+        isRecording = true;
+        recordBtn.textContent = '⏹️ Stop Recording';
+        recordBtn.classList.add('recording');
+        statusEl.textContent = 'Listening… (using system mic — AirPods if connected)';
+      } catch (err) {
+        statusEl.textContent = 'Mic access failed: ' + err.message;
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && isRecording) {
+        mediaRecorder.stop();
+        isRecording = false;
+        recordBtn.textContent = '🎙️ Start Recording';
+        recordBtn.classList.remove('recording');
+        statusEl.textContent = 'Transcribing…';
+        recordBtn.disabled = true;
+      }
+    }
+
+    async function sendForTranscription(blob) {
+      try {
+        const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+        const form = new FormData();
+        form.append('file', blob, `audio.${ext}`);
+
+        const resp = await fetch(WORKER_URL, { method: 'POST', body: form });
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+
+        transcriptEl.textContent = data.text || '(no speech detected)';
+        statusEl.textContent = 'Done.';
+      } catch (err) {
+        statusEl.textContent = 'Transcription failed: ' + err.message;
+      } finally {
+        recordBtn.disabled = false;
+      }
+    }
+
+    recordBtn.addEventListener('click', () => {
+      if (!isRecording) startRecording();
+      else stopRecording();
+    });
   </script>
 </body>
 </html>
