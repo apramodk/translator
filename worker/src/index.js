@@ -53,10 +53,10 @@ export default {
       if (language) forwardForm.append("language", language);
 
       const fireworksResp = await fetch(
-        "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions",
+        "https://audio-turbo.api.fireworks.ai/v1/audio/transcriptions",
         {
           method: "POST",
-          headers: { Authorization: env.FIREWORKS_API_KEY },
+          headers: { Authorization: `Bearer ${env.FIREWORKS_API_KEY}` },
           body: forwardForm,
         }
       );
